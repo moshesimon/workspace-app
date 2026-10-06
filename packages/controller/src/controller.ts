@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { canonicalNew, resolveCommit } from "./git/command.js";
 import { reconcileGit } from "./operations/recovery.js";
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, realpath, lstat } from "node:fs/promises";
 import { join, basename, relative } from "node:path";
 import {
   commands,
@@ -72,6 +72,7 @@ export class Controller {
         .all("service_instances")
         .some((s) =>
           [
+            "ready",
             "running",
             "starting",
             "listening",
@@ -82,7 +83,16 @@ export class Controller {
         ) &&
       !this.store
         .all("runtime_resources")
-        .some((s) => ["running", "starting", "unknown"].includes(s.state))
+        .some((s) =>
+          [
+            "ready",
+            "running",
+            "starting",
+            "degraded",
+            "unknown",
+            "stopping",
+          ].includes(s.state),
+        )
     );
   }
   private get<T>(table: string, id: string): T {
@@ -290,6 +300,17 @@ export class Controller {
     } catch (error) {
       intent.state = "creation-failed";
       intent.creationError = errorRecord(error);
+      const registered = (await discoverWorktrees(repo.path)).some(
+        (w) => w.path === path,
+      );
+      let exists = true;
+      try {
+        await lstat(path);
+      } catch (e: any) {
+        if (e.code === "ENOENT") exists = false;
+        else throw e;
+      }
+      if (!registered && !exists) intent.removedAt = now();
       this.store.put("checkouts", intent);
       throw error;
     }
@@ -347,6 +368,12 @@ export class Controller {
     const manifest = this.revision(this.workspace(c.workspaceId)).manifest;
     return [
       ...new Set([
+        ...this.store
+          .all("runtime_resources")
+          .filter((row) => row.checkoutId === c.id && row.ownership === "owned")
+          .flatMap(
+            (row) => row.disposablePaths ?? row.profile?.disposablePaths ?? [],
+          ),
         ...manifest.resources
           .filter(
             (r) => r.repository === c.repositoryKey && r.adapter !== "external",
@@ -363,7 +390,7 @@ export class Controller {
     const selected = this.checkouts(workspace.id).filter(
       (c) => !i.checkoutId || c.id === i.checkoutId,
     );
-    if (!selected.length)
+    if (!selected.length && i.checkoutId)
       throw new DomainError("INVALID_INPUT", "No matching checkouts");
     const targets = [];
     for (const c of selected)
@@ -374,8 +401,9 @@ export class Controller {
           this.disposablePaths(c),
         ),
       );
-    const resources = this.runtime
-      .listResources(workspace.id)
+    const resources = this.store
+      .all("runtime_resources")
+      .filter((row) => row.workspaceId === workspace.id)
       .filter((r) => !i.checkoutId || r.checkoutId === i.checkoutId)
       .map((r) => ({
         id: r.id,
@@ -601,7 +629,8 @@ export class Controller {
             ...this.runtime.listResources(w.id),
           ].some(
             (s) =>
-              !["stopped", "failed", "removed", "external"].includes(s.state),
+              s.ownership !== "external" &&
+              !["stopped", "failed", "removed", "destroyed"].includes(s.state),
           )
         )
           throw new DomainError(
@@ -618,6 +647,58 @@ export class Controller {
             "CONFIGURATION_CHANGED",
             "Create missing repository checkouts before applying this revision",
           );
+        for (const owned of this.store
+          .all("runtime_resources")
+          .filter(
+            (row) =>
+              row.workspaceId === w.id &&
+              row.ownership === "owned" &&
+              row.state !== "destroyed",
+          )) {
+          const replacement = r.manifest.resources.find(
+            (profile) =>
+              profile.id === owned.logicalId &&
+              profile.repository === owned.repositoryKey,
+          );
+          if (
+            replacement &&
+            owned.retiredAt &&
+            JSON.stringify(replacement) === JSON.stringify(owned.profile)
+          ) {
+            delete owned.retiredAt;
+            this.store.put("runtime_resources", owned);
+          }
+          if (
+            replacement &&
+            JSON.stringify(replacement) !== JSON.stringify(owned.profile)
+          )
+            throw new DomainError(
+              "CONFIGURATION_CHANGED",
+              "Changing existing owned infrastructure requires a new workspace. Its current data is retained.",
+            );
+        }
+        for (const table of [
+          "service_instances",
+          "runtime_resources",
+          "setup_receipts",
+        ]) {
+          for (const row of this.store
+            .all(table)
+            .filter((row) => row.workspaceId === w.id && !row.retiredAt)) {
+            if (
+              table === "runtime_resources" &&
+              row.ownership === "owned" &&
+              r.manifest.resources.some(
+                (profile) =>
+                  profile.id === row.logicalId &&
+                  profile.repository === row.repositoryKey,
+              )
+            )
+              continue;
+            row.retiredAt = now();
+            this.store.put(table, row);
+          }
+        }
         w.configurationRevisionId = r.id;
         this.store.put("workspaces", w);
         return w;

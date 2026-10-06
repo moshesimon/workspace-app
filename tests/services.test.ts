@@ -475,3 +475,206 @@ test("a foreground wrapper attributes child HTTP listeners and Stop removes only
     await f.cleanup();
   }
 });
+// Releasing a stopped backend's port while a UI still references it can route that UI to another workspace.
+test("a stopped API keeps its port reserved while its running UI still references it", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.root, "reserved-api.cjs"),
+    `require('http').createServer((q,r)=>r.end(process.env.MARKER)).listen(+process.env.PORT,'127.0.0.1')`,
+  );
+  await writeFile(
+    path.join(f.root, "reserved-ui.cjs"),
+    `require('http').createServer(async(q,r)=>{try{r.end(await(await fetch(process.env.API)).text())}catch{r.statusCode=503;r.end('unavailable')}}).listen(+process.env.PORT,'127.0.0.1')`,
+  );
+  const api = {
+    id: "api",
+    repository: "app",
+    executable: process.execPath,
+    args: ["reserved-api.cjs"],
+    cwd: ".",
+    env: { PORT: "{{self.port}}", MARKER: "{{workspace.id}}" },
+    dependsOn: [],
+    runtimePaths: [],
+    port: { preferred: 25600, min: 25600, max: 25699 },
+    readiness: { type: "http", timeoutMs: 2000 },
+  };
+  const ui = {
+    ...api,
+    id: "ui",
+    args: ["reserved-ui.cjs"],
+    env: { PORT: "{{self.port}}", API: "{{service.api.url}}" },
+    dependsOn: [],
+    port: { preferred: 25700, min: 25700, max: 25799 },
+  };
+  const revision = f.revision({ services: [api, ui] });
+  try {
+    await f.runtime.start(f.workspace("A"), revision, [f.checkout("A")]);
+    const aApi = f.runtime
+      .listServices("A")
+      .find((s) => s.logicalId === "api")!;
+    const aUi = f.runtime.listServices("A").find((s) => s.logicalId === "ui")!;
+    await f.runtime.stop("A", undefined, aApi.id);
+    await f.runtime.start(f.workspace("B"), revision, [f.checkout("B")]);
+    const bApi = f.runtime
+      .listServices("B")
+      .find((s) => s.logicalId === "api")!;
+    assert.notEqual(bApi.assignedPort, aApi.assignedPort);
+    assert.equal((await fetch(aUi.url!)).status, 503);
+    await f.runtime.start(
+      f.workspace("A"),
+      revision,
+      [f.checkout("A")],
+      undefined,
+      aApi.id,
+    );
+    assert.equal(
+      f.runtime.listServices("A").find((s) => s.logicalId === "api")!
+        .assignedPort,
+      aApi.assignedPort,
+    );
+    assert.equal(await (await fetch(aUi.url!)).text(), "A");
+    assert.equal(await (await fetch(bApi.url!)).text(), "B");
+    await f.runtime.stop("A");
+    assert(
+      !f.store.all<any>("port_reservations").some((r) => r.workspaceId === "A"),
+    );
+  } finally {
+    await f.runtime.stop("A");
+    await f.runtime.stop("B");
+    await f.cleanup();
+  }
+});
+// A preserved process cannot be silently treated as if its inherited secrets/URLs were updated.
+test("Start rejects resolved configuration drift in preserved services before launching new processes", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.root, "drift.cjs"),
+    `require('http').createServer((q,r)=>r.end(process.env.TOKEN)).listen(+process.env.PORT,'127.0.0.1')`,
+  );
+  const profile = (id: string) => ({
+    id,
+    repository: "app",
+    executable: process.execPath,
+    args: ["drift.cjs"],
+    cwd: ".",
+    env: { PORT: "{{self.port}}", TOKEN: "{{secret.WM_PRESERVED_SECRET}}" },
+    dependsOn: [],
+    runtimePaths: [],
+    port: {
+      preferred: id === "api" ? 25800 : 25900,
+      min: id === "api" ? 25800 : 25900,
+      max: id === "api" ? 25899 : 25999,
+    },
+    readiness: { type: "http", timeoutMs: 2000 },
+  });
+  process.env.WM_PRESERVED_SECRET = "original-inherited-secret";
+  try {
+    await f.runtime.start(
+      f.workspace("A"),
+      f.revision({ services: [profile("api")] }),
+      [f.checkout("A")],
+    );
+    const existing = f.runtime.listServices("A")[0]!;
+    process.env.WM_PRESERVED_SECRET = "changed-local-secret";
+    await assert.rejects(
+      f.runtime.start(
+        f.workspace("A"),
+        f.revision({ services: [profile("api"), profile("ui")] }),
+        [f.checkout("A")],
+      ),
+      (e: any) => e.code === "CONFIGURATION_CHANGED",
+    );
+    assert.equal(f.runtime.listServices("A").length, 1);
+    assert.equal(
+      await (await fetch(existing.url!)).text(),
+      "original-inherited-secret",
+    );
+    const persisted = JSON.stringify(f.store.all<any>("service_instances"));
+    assert(!persisted.includes("original-inherited-secret"));
+    assert(!persisted.includes("changed-local-secret"));
+    assert.equal(
+      typeof f.runtime.listServices("A")[0]!.resolvedConfigurationHash,
+      "string",
+    );
+  } finally {
+    await f.runtime.stop("A");
+    delete process.env.WM_PRESERVED_SECRET;
+    await f.cleanup();
+  }
+});
+// Applying a pinned revision must hide retired runtime rows and invalidate the old manifest cache for Refresh.
+test("retired runtime rows stay historical and Refresh uses the newly pinned manifest", async () => {
+  const f = await fixture();
+  const old = f.revision();
+  f.store.put("workspaces", f.workspace("A"));
+  f.store.put("configuration_revisions", old);
+  f.store.put("checkouts", f.checkout("A"));
+  await f.runtime.prepare(f.workspace("A"), old, [f.checkout("A")]);
+  await writeFile(
+    path.join(f.root, "current-resource.cjs"),
+    `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:process.env.WORKTREE_RESOURCE_IDENTITY,state:'ready',ownership:'owned',observedPorts:[],dataPaths:[]}))`,
+  );
+  const hook = { executable: process.execPath, args: ["current-resource.cjs"] };
+  const profile = {
+    id: "current",
+    repository: "app",
+    adapter: "command",
+    args: [],
+    cwd: ".",
+    env: {},
+    dependsOn: [],
+    hooks: { start: hook, status: hook, stop: hook, destroy: hook },
+    disposablePaths: [],
+  };
+  const revision = {
+    ...f.revision({ resources: [profile] }),
+    id: "replacement",
+    hash: "v2",
+  };
+  f.store.put("configuration_revisions", revision);
+  f.store.put("workspaces", {
+    ...f.workspace("A"),
+    configurationRevisionId: "replacement",
+  });
+  for (const table of [
+    "service_instances",
+    "runtime_resources",
+    "setup_receipts",
+  ])
+    f.store.put(table, {
+      id: "retired-" + table,
+      workspaceId: "A",
+      checkoutId: "A",
+      logicalId: "retired",
+      state: "planned",
+      retiredAt: "2026-10-06T00:00:00Z",
+    });
+  f.store.put("runtime_resources", {
+    id: "current",
+    workspaceId: "A",
+    checkoutId: "A",
+    configurationRevisionId: "replacement",
+    logicalId: "current",
+    adapter: "command",
+    namespace: "wm-A-A-current",
+    identity: "current-identity",
+    ownership: "owned",
+    state: "ready",
+    dependencies: [],
+    profile,
+    logPath: path.join(f.root, "current.log"),
+  });
+  try {
+    assert.equal(f.runtime.listServices("A").length, 0);
+    assert.equal(f.runtime.listSetup("A").length, 0);
+    assert.equal(f.runtime.listResources("A").length, 1);
+    const refreshed = await f.runtime.refresh("A");
+    assert.equal(refreshed.resources[0]!.state, "ready");
+    assert.equal(
+      f.store.get<any>("runtime_resources", "retired-runtime_resources")!.state,
+      "planned",
+    );
+  } finally {
+    await f.cleanup();
+  }
+});

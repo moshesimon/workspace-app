@@ -62,7 +62,10 @@ export async function runSetup(
   const inputHash = inputFingerprint(salt, {
     profile,
     configuration: scope.configurationHash,
-    repository: await repositoryInputs(context.checkoutPath),
+    repository: await repositoryInputs(
+      context.checkoutPath,
+      profile.inputs ?? [],
+    ),
     resolved,
   });
   const matching = store

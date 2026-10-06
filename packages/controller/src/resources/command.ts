@@ -158,7 +158,12 @@ export class CommandAdapter implements RuntimeAdapter {
     this.verify(handle);
     const ctx = await this.contextFor(handle);
     await this.hook(ctx, "status", handle.identity);
-    await this.hook(ctx, "stop", handle.identity);
+    const stopped = await this.hook(ctx, "stop", handle.identity);
+    if (stopped.state !== "stopped")
+      throw new DomainError(
+        "DEPENDENCY_UNAVAILABLE",
+        "Resource stop hook did not confirm stopped state",
+      );
   }
   async destroy(handle: ResourceHandle, preview: any) {
     this.verify(handle);
@@ -176,6 +181,11 @@ export class CommandAdapter implements RuntimeAdapter {
       );
     const ctx = await this.contextFor(handle);
     await this.hook(ctx, "status", handle.identity);
-    await this.hook(ctx, "destroy", handle.identity);
+    const destroyed = await this.hook(ctx, "destroy", handle.identity);
+    if (destroyed.state !== "stopped")
+      throw new DomainError(
+        "DEPENDENCY_UNAVAILABLE",
+        "Resource destroy hook did not confirm stopped state",
+      );
   }
 }

@@ -28,7 +28,10 @@
     "verify:github": "tsx --test tests/github.test.ts",
     "verify:desktop": "tsx scripts/verify-desktop.ts",
     "verify:parity": "tsx --test tests/parity.test.ts",
-    "verify:integration": "tsx --test tests/integration.test.ts"
+    "verify:integration": "tsx --test tests/integration.test.ts",
+    "demo:launch": "tsx scripts/demo-launch.ts",
+    "verify:packaged": "tsx scripts/verify-packaged.ts",
+    "format": "prettier --write apps packages scripts tests fixtures skills docs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",

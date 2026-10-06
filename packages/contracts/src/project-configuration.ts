@@ -48,6 +48,7 @@ export const serviceSchema = z.object({
   url: z.string().optional(),
 });
 export const setupSchema = z.object({
+  inputs: z.array(relative).default([]),
   ...execution,
   executable: z.string().min(1),
   runPolicy: z.enum(["oncePerInputs", "always"]).default("oncePerInputs"),

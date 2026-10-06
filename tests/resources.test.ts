@@ -68,7 +68,7 @@ test("command resources require namespace identity and retain external resources
   const f = await fixture();
   await writeFile(
     path.join(f.root, "adapter.cjs"),
-    `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:'db-'+process.env.WORKTREE_RESOURCE_NAMESPACE,state:'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
+    `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:'db-'+process.env.WORKTREE_RESOURCE_NAMESPACE,state:process.argv[2]==='stop'?'stopped':'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
   );
   const command = { executable: process.execPath, args: ["adapter.cjs"] };
   const resource = {
@@ -79,7 +79,12 @@ test("command resources require namespace identity and retain external resources
     cwd: ".",
     env: {},
     dependsOn: [],
-    hooks: { start: command, status: command, stop: command, destroy: command },
+    hooks: {
+      start: command,
+      status: command,
+      stop: { ...command, args: [...command.args, "stop"] },
+      destroy: { ...command, args: [...command.args, "stop"] },
+    },
     disposablePaths: [],
   };
   try {
@@ -93,7 +98,7 @@ test("command resources require namespace identity and retain external resources
     assert(row.identity.includes("one"));
     await writeFile(
       path.join(f.root, "adapter.cjs"),
-      `console.log(JSON.stringify({namespace:'wrong',identity:'db-other',state:'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
+      `console.log(JSON.stringify({namespace:'wrong',identity:'db-other',state:process.argv[2]==='stop'?'stopped':'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
     );
     await assert.rejects(
       f.runtime.stop("one"),
@@ -101,7 +106,7 @@ test("command resources require namespace identity and retain external resources
     );
     await writeFile(
       path.join(f.root, "adapter.cjs"),
-      `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:'db-'+process.env.WORKTREE_RESOURCE_NAMESPACE,state:'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
+      `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:'db-'+process.env.WORKTREE_RESOURCE_NAMESPACE,state:process.argv[2]==='stop'?'stopped':'ready',observedPorts:[],dataPaths:[],ownership:'owned'}))`,
     );
     await f.runtime.stop("one");
   } finally {
@@ -318,6 +323,183 @@ test("command resource readiness rejects a claimed but unpublished port", async 
       ),
       (e: any) => e.code === "DEPENDENCY_UNAVAILABLE",
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+// A retry after partial Git removal must retain prior cleanup and never delete newly created replacement data.
+test("Destroy retries preserve already destroyed resource outcomes and newly recreated data", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.root, "retry-db.cjs"),
+    `require('fs').mkdirSync('.data',{recursive:true});require('fs').writeFileSync('.data/owned','first');require('http').createServer((q,r)=>r.end('db')).listen(+process.env.PORT,'127.0.0.1')`,
+  );
+  const resource = {
+    id: "db",
+    repository: "app",
+    adapter: "process",
+    executable: process.execPath,
+    args: ["retry-db.cjs"],
+    cwd: ".",
+    env: { PORT: "{{self.port}}" },
+    dependsOn: [],
+    port: { preferred: 26000, min: 26000, max: 26099 },
+    disposablePaths: [".data"],
+  };
+  try {
+    await f.runtime.start(
+      f.workspace("one"),
+      f.revision({ resources: [resource] }),
+      [f.checkout("one")],
+    );
+    const row = f.runtime.listResources("one")[0]!;
+    const preview = {
+      resources: [
+        {
+          id: row.id,
+          identity: row.identity,
+          namespace: row.namespace,
+          disposablePaths: [".data"],
+        },
+      ],
+    };
+    await f.runtime.destroy("one", undefined, preview);
+    await writeFile(path.join(f.root, "replacement-marker"), "unchanged");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(path.join(f.root, ".data"));
+    await writeFile(path.join(f.root, ".data", "new-user-data"), "preserve");
+    const result = await f.runtime.destroy("one", undefined, preview);
+    assert.equal(result.outcomes[0]!.status, "destroyed");
+    assert.equal(result.outcomes[0]!.alreadyDestroyed, true);
+    assert.equal(
+      await readFile(path.join(f.root, ".data", "new-user-data"), "utf8"),
+      "preserve",
+    );
+    assert.equal(f.runtime.listResources("one")[0]!.state, "destroyed");
+    await assert.rejects(
+      f.runtime.destroy("one", undefined, {
+        resources: [{ ...preview.resources[0], identity: "wrong" }],
+      }),
+      (e: any) => e.code === "OWNERSHIP_UNVERIFIED",
+    );
+    assert.equal(
+      await readFile(path.join(f.root, ".data", "new-user-data"), "utf8"),
+      "preserve",
+    );
+  } finally {
+    await f.runtime.stop("one");
+    await f.cleanup();
+  }
+});
+// Removing a resource definition must not strand its retained data or erase the revision needed for verified cleanup.
+test("retired resources use their historical revision for workspace Destroy after the manifest removes them", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.root, "historical-db.cjs"),
+    `require('fs').mkdirSync('historical-data',{recursive:true});require('fs').writeFileSync('historical-data/value','retained');require('http').createServer((q,r)=>r.end('db')).listen(+process.env.PORT,'127.0.0.1')`,
+  );
+  const resource = {
+    id: "db",
+    repository: "app",
+    adapter: "process",
+    executable: process.execPath,
+    args: ["historical-db.cjs"],
+    cwd: ".",
+    env: { PORT: "{{self.port}}" },
+    dependsOn: [],
+    port: { preferred: 26100, min: 26100, max: 26199 },
+    disposablePaths: ["historical-data"],
+  };
+  const old = f.revision({ resources: [resource] });
+  f.store.put("workspaces", f.workspace("one"));
+  f.store.put("configuration_revisions", old);
+  f.store.put("checkouts", f.checkout("one"));
+  try {
+    await f.runtime.start(f.workspace("one"), old, [f.checkout("one")]);
+    await f.runtime.stop("one");
+    const handle = f.runtime.listResources("one")[0]!;
+    f.store.put("runtime_resources", {
+      ...handle,
+      retiredAt: "2026-10-06T00:00:00Z",
+    });
+    const current = { ...f.revision(), id: "replacement", hash: "v2" };
+    f.store.put("configuration_revisions", current);
+    f.store.put("workspaces", {
+      ...f.workspace("one"),
+      configurationRevisionId: "replacement",
+    });
+    const restarted = new RuntimeManager(f.store as any, f.root);
+    assert.equal(restarted.listResources("one").length, 0);
+    const result = await restarted.destroy("one", undefined, {
+      resources: [
+        {
+          id: handle.id,
+          identity: handle.identity,
+          namespace: handle.namespace,
+          disposablePaths: ["historical-data"],
+        },
+      ],
+    });
+    assert.equal(result.outcomes[0]!.status, "destroyed");
+    assert.equal(
+      f.store.get<any>("runtime_resources", handle.id)!.state,
+      "destroyed",
+    );
+    await assert.rejects(
+      readFile(path.join(f.root, "historical-data/value")),
+      (e: any) => e.code === "ENOENT",
+    );
+  } finally {
+    await f.runtime.stop("one");
+    await f.cleanup();
+  }
+});
+// Zero-exit hooks that still report ready must not be recorded as successful Stop or Destroy.
+test("command cleanup hooks must confirm terminal stopped state", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.root, "not-stopped.cjs"),
+    `console.log(JSON.stringify({namespace:process.env.WORKTREE_RESOURCE_NAMESPACE,identity:'db',state:'ready',ownership:'owned',observedPorts:[],dataPaths:[]}))`,
+  );
+  const hook = { executable: process.execPath, args: ["not-stopped.cjs"] };
+  const resource = {
+    id: "db",
+    repository: "app",
+    adapter: "command",
+    args: [],
+    cwd: ".",
+    env: {},
+    dependsOn: [],
+    hooks: { start: hook, status: hook, stop: hook, destroy: hook },
+    disposablePaths: [],
+  };
+  try {
+    await f.runtime.start(
+      f.workspace("one"),
+      f.revision({ resources: [resource] }),
+      [f.checkout("one")],
+    );
+    const row = f.runtime.listResources("one")[0]!;
+    await assert.rejects(
+      f.runtime.stop("one"),
+      (e: any) => e.code === "DEPENDENCY_UNAVAILABLE",
+    );
+    assert.notEqual(f.runtime.listResources("one")[0]!.state, "stopped");
+    f.store.put("runtime_resources", { ...row, state: "stopped" });
+    await assert.rejects(
+      f.runtime.destroy("one", undefined, {
+        resources: [
+          {
+            id: row.id,
+            identity: row.identity,
+            namespace: row.namespace,
+            disposablePaths: [],
+          },
+        ],
+      }),
+      (e: any) => e.code === "OWNERSHIP_UNVERIFIED",
+    );
+    assert.notEqual(f.runtime.listResources("one")[0]!.state, "destroyed");
   } finally {
     await f.cleanup();
   }

@@ -106,6 +106,11 @@ test("controller creates two pinned workspaces, runs isolated instances, passive
       const start = await f.act("lifecycle.start", { workspaceId });
       assert.equal(start.status, "succeeded", JSON.stringify(start.error));
     }
+    assert.equal(
+      f.c.isIdle,
+      false,
+      "Ready services must keep the controller alive",
+    );
     const sa = f.c.runtime.listServices(wa.id)[0],
       sb = f.c.runtime.listServices(wb.id)[0];
     assert.notEqual(sa.assignedPort, sb.assignedPort);
@@ -286,6 +291,100 @@ test("portable projects rebind to a moved root while preserving configuration re
     assert.equal(refuse.status, "failed");
     assert.equal(refuse.error?.code, "OPERATION_CONFLICT");
   } finally {
+    await f.close();
+  }
+});
+test("failed checkout creation can be retried and empty failed workspace can be destroyed", async () => {
+  const f = await fixture();
+  try {
+    const p = (
+      await f.act("projects.register", { root: f.repo, manifest: f.manifest })
+    ).result.project;
+    const failed = await f.act("workspaces.create", {
+      projectId: p.id,
+      name: "Conflict",
+      branch: "main",
+    });
+    assert.equal(failed.status, "partial");
+    const workspace = failed.result.workspace;
+    const repository = f.c.store.all<any>("repositories")[0];
+    const retry = await f.act("checkouts.create", {
+      workspaceId: workspace.id,
+      repositoryId: repository.id,
+      branch: "retry",
+    });
+    assert.equal(retry.status, "succeeded", JSON.stringify(retry.error));
+    const another = await f.act("workspaces.create", {
+      projectId: p.id,
+      name: "Empty",
+      branch: "main",
+    });
+    const preview = await f.c.call("destroy.preview", {
+      workspaceId: another.result.workspace.id,
+    });
+    const destroyed = await f.act("destroy.execute", {
+      previewId: preview.id,
+      discardChanges: false,
+    });
+    assert.equal(destroyed.status, "succeeded", JSON.stringify(destroyed));
+    assert.ok(
+      f.c.store.get<any>("workspaces", another.result.workspace.id).removedAt,
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("a ready external resource does not block applying a stopped configuration revision", async () => {
+  const f = await fixture();
+  const { createServer } = await import("node:http");
+  const server = createServer((q, r) => r.end("external"));
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const manifest = {
+      ...f.manifest,
+      services: [],
+      entrypoints: [],
+      resources: [
+        {
+          id: "external",
+          repository: "app",
+          adapter: "external",
+          url: `http://127.0.0.1:${(server.address() as any).port}`,
+        },
+      ],
+    };
+    const p = (await f.act("projects.register", { root: f.repo, manifest }))
+      .result.project;
+    const w = (
+      await f.act("workspaces.create", {
+        projectId: p.id,
+        name: "External",
+        branch: "external",
+      })
+    ).result.workspace;
+    assert.equal(
+      (await f.act("lifecycle.start", { workspaceId: w.id })).status,
+      "succeeded",
+    );
+    await f.act("lifecycle.stop", { workspaceId: w.id });
+    const revision = (
+      await f.act("configuration.import", {
+        projectId: p.id,
+        manifest: { ...manifest, name: "Changed" },
+      })
+    ).result;
+    const applied = await f.act("configuration.apply", {
+      workspaceId: w.id,
+      revisionId: revision.id,
+    });
+    assert.equal(applied.status, "succeeded", JSON.stringify(applied.error));
+    assert.equal(
+      await fetch(manifest.resources[0].url).then((r) => r.text()),
+      "external",
+    );
+    assert.equal(f.c.runtime.listResources(w.id).length, 0);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
     await f.close();
   }
 });

@@ -86,17 +86,22 @@ export class RuntimeManager {
   listServices(workspaceId: string): ServiceInstance[] {
     return this.store
       .all<ServiceInstance>("service_instances")
-      .filter((r) => r.workspaceId === workspaceId);
+      .filter((r) => r.workspaceId === workspaceId && !r.retiredAt);
   }
   listResources(workspaceId: string): RuntimeResource[] {
     return this.store
       .all<RuntimeResource>("runtime_resources")
-      .filter((r) => r.workspaceId === workspaceId);
+      .filter((r) => r.workspaceId === workspaceId && !r.retiredAt);
+  }
+  private resourceCleanupRows(workspaceId: string): RuntimeResource[] {
+    return this.store
+      .all<RuntimeResource>("runtime_resources")
+      .filter((row) => row.workspaceId === workspaceId);
   }
   listSetup(workspaceId: string): SetupReceipt[] {
     return this.store
       .all<SetupReceipt>("setup_receipts")
-      .filter((r) => r.workspaceId === workspaceId);
+      .filter((r) => r.workspaceId === workspaceId && !r.retiredAt);
   }
   logs(id: string, offset = 0, limit = 65536) {
     const row =
@@ -138,8 +143,13 @@ export class RuntimeManager {
   }
   private scope(workspaceId: string) {
     const cached = this.cached.get(workspaceId);
-    if (cached) return cached;
     const workspace = this.store.get<Workspace>("workspaces", workspaceId);
+    if (
+      cached &&
+      (!workspace || workspace.configurationRevisionId === cached.revision.id)
+    )
+      return cached;
+    if (cached) this.cached.delete(workspaceId);
     if (!workspace) throw new DomainError("INVALID_INPUT", "Unknown workspace");
     const revision = this.store.get<ConfigurationRevision>(
       "configuration_revisions",
@@ -190,6 +200,7 @@ export class RuntimeManager {
       .all<any>(table)
       .filter(
         (r) =>
+          !r.retiredAt &&
           r.workspaceId === workspaceId &&
           r.checkoutId === node.checkout.id &&
           r.logicalId === node.profile.id,
@@ -322,7 +333,7 @@ export class RuntimeManager {
           .filter(
             (r) =>
               r.workspaceId !== workspace.id &&
-              ["reserved", "active"].includes(r.state),
+              ["reserved", "active", "retained"].includes(r.state),
           )
           .map((r) => r.port),
       );
@@ -383,6 +394,27 @@ export class RuntimeManager {
           n.url = n.row?.url;
         }
       }
+      const retained = this.store
+        .all<any>("port_reservations")
+        .filter(
+          (r) => r.workspaceId === workspace.id && r.state === "retained",
+        );
+      const ownsRetainedPort = (spec: { id: string }) =>
+        retained.some(
+          (r) => all.find((n) => n.key === spec.id)?.row?.id === r.ownerId,
+        );
+      for (const reservation of retained)
+        if (
+          !specs.some(
+            (spec) =>
+              all.find((n) => n.key === spec.id)?.row?.id ===
+              reservation.ownerId,
+          )
+        )
+          excluded.add(reservation.port);
+      specs.sort(
+        (a, b) => Number(ownsRetainedPort(b)) - Number(ownsRetainedPort(a)),
+      );
       const allocated = await allocatePorts(specs, excluded);
       for (const [key, lease] of allocated) leases.set(key, lease);
       for (const n of all) {
@@ -404,6 +436,29 @@ export class RuntimeManager {
         }
       }
       urls = this.urls(all, revision);
+      // A preserved process still has its original inherited environment and arguments.
+      // Validate every live service, including services outside this operation's scope,
+      // before recording a new plan or executing setup/resource/service commands.
+      for (const n of all.filter(
+        (n) => n.kind === "service" && n.row?.state === "ready",
+      )) {
+        const context = this.resolution(n, workspace.id, urls, revision);
+        const resolved = await resolveProfile(n.profile, context);
+        const fingerprint = this.resolvedConfigurationHash(
+          revision,
+          n.url,
+          resolved,
+        );
+        if (
+          !n.row.resolvedConfigurationHash ||
+          n.row.resolvedConfigurationHash !== fingerprint
+        )
+          throw new DomainError(
+            "CONFIGURATION_CHANGED",
+            `Running service ${n.key} has different resolved inputs; stop it before changing its configuration`,
+            { serviceId: n.row.id },
+          );
+      }
       for (const n of selected) {
         n.context = this.resolution(n, workspace.id, urls, revision);
         if (n.kind === "resource" && !n.profile.executable) {
@@ -506,6 +561,17 @@ export class RuntimeManager {
         if (n.kind === "service") {
           for (const directory of n.profile.runtimePaths ?? [])
             await containedPath(n.checkout.path, directory, true);
+          n.row.resolvedConfigurationHash = this.resolvedConfigurationHash(
+            revision,
+            n.url,
+            n.resolved,
+          );
+          n.row.runtimeReferenceIds = this.runtimeReferenceIds(
+            n,
+            all,
+            revision,
+            workspace.id,
+          );
           const identity = await launch(
             n.resolved,
             n.row.logPath,
@@ -637,9 +703,95 @@ export class RuntimeManager {
       await Promise.all([...leases.values()].map((l) => l.release()));
     }
   }
+  private resolvedConfigurationHash(
+    revision: ConfigurationRevision,
+    url: string | undefined,
+    resolved: any,
+  ) {
+    return inputFingerprint(this.salt, {
+      configurationRevisionId: revision.id,
+      url,
+      resolved,
+    });
+  }
+  private runtimeReferenceIds(
+    node: Node,
+    all: Node[],
+    revision: ConfigurationRevision,
+    workspaceId: string,
+  ) {
+    const found = new Set<string>();
+    const visited = new Set<string>();
+    const urls = this.urls(all, revision);
+    const visit = (current: Node) => {
+      if (visited.has(current.key)) return;
+      visited.add(current.key);
+      for (const dependency of current.profile.dependsOn ?? []) {
+        const target = all.find((n) => n.key === dependency);
+        if (target) {
+          if (target.kind !== "setup" && target.row?.id)
+            found.add(target.row.id);
+          visit(target);
+        }
+      }
+      const context = this.resolution(current, workspaceId, urls, revision);
+      const templates = [
+        current.profile.executable ?? "",
+        ...(current.profile.args ?? []),
+        ...Object.values(current.profile.env ?? {}),
+        current.profile.url ?? "",
+      ];
+      for (const template of templates)
+        for (const match of String(template).matchAll(
+          /\{\{\s*((?:service|resource)\.[^{}]+?\.url)\s*\}\}/g,
+        )) {
+          const url = context.urls[match[1]];
+          if (!url) continue;
+          for (const target of all)
+            if (target.kind !== "setup" && target.url === url && target.row?.id)
+              found.add(target.row.id);
+        }
+    };
+    visit(node);
+    found.delete(node.row?.id);
+    return [...found].sort();
+  }
+  private hasLiveReference(ownerId: string) {
+    const owner =
+      this.store.get<any>("service_instances", ownerId) ??
+      this.store.get<any>("runtime_resources", ownerId);
+    if (!owner) return false;
+    const ownerKey = `${owner.adapter ? "resource" : "service"}:${owner.adapter ? "" : owner.repositoryKey + "/"}${owner.logicalId}`;
+    return this.store
+      .all<any>("service_instances")
+      .some(
+        (row) =>
+          row.id !== ownerId &&
+          !row.retiredAt &&
+          row.workspaceId === owner.workspaceId &&
+          ["ready", "running", "starting", "degraded", "unknown"].includes(
+            row.state,
+          ) &&
+          (row.runtimeReferenceIds?.includes(ownerId) ||
+            row.dependencies?.includes(ownerKey)),
+      );
+  }
   private releaseReservations(ownerId: string) {
     for (const row of this.store.all<any>("port_reservations"))
-      if (row.ownerId === ownerId)
+      if (row.ownerId === ownerId) {
+        if (this.hasLiveReference(ownerId)) {
+          row.state = "retained";
+          this.store.put("port_reservations", row);
+        } else this.store.delete("port_reservations", row.id);
+      }
+  }
+  private releaseUnusedRetainedReservations(workspaceId: string) {
+    for (const row of this.store.all<any>("port_reservations"))
+      if (
+        row.workspaceId === workspaceId &&
+        row.state === "retained" &&
+        !this.hasLiveReference(row.ownerId)
+      )
         this.store.delete("port_reservations", row.id);
   }
   private adapter(handle: any): RuntimeAdapter {
@@ -650,10 +802,44 @@ export class RuntimeManager {
   private async resourceContext(
     handle: ResourceHandle,
   ): Promise<ResourceContext> {
-    const scope = this.scope(handle.workspaceId);
-    const nodes = this.nodes(scope.revision, scope.checkouts);
+    const cached = this.cached.get(handle.workspaceId);
+    const revision =
+      this.store.get<ConfigurationRevision>(
+        "configuration_revisions",
+        handle.configurationRevisionId,
+      ) ??
+      (cached?.revision.id === handle.configurationRevisionId
+        ? cached.revision
+        : undefined);
+    if (!revision)
+      throw new DomainError(
+        "CONFIGURATION_CHANGED",
+        "Historical resource configuration is unavailable",
+      );
+    const checkouts = this.store
+      .all<Checkout>("checkouts")
+      .filter((checkout) => checkout.workspaceId === handle.workspaceId);
+    for (const checkout of cached?.checkouts ?? [])
+      if (!checkouts.some((current) => current.id === checkout.id))
+        checkouts.push(checkout);
+    const nodes = this.nodes(revision, checkouts);
     for (const n of nodes) {
-      const row = this.existing(handle.workspaceId, n);
+      const table =
+        n.kind === "service"
+          ? "service_instances"
+          : n.kind === "resource"
+            ? "runtime_resources"
+            : "setup_receipts";
+      const row = this.store
+        .all<any>(table)
+        .filter(
+          (row) =>
+            row.workspaceId === handle.workspaceId &&
+            row.checkoutId === n.checkout.id &&
+            row.logicalId === n.profile.id &&
+            row.configurationRevisionId === revision.id,
+        )
+        .at(-1);
       n.port = row?.assignedPort;
       n.url = row?.url;
     }
@@ -671,8 +857,8 @@ export class RuntimeManager {
     const resolution = this.resolution(
       node,
       handle.workspaceId,
-      this.urls(nodes, scope.revision),
-      scope.revision,
+      this.urls(nodes, revision),
+      revision,
     );
     const profile = handle.profile ?? node.profile;
     let resolved: any;
@@ -769,12 +955,12 @@ export class RuntimeManager {
     const rows = this.reverseOrder(
       [
         ...this.listServices(workspaceId),
-        ...this.listResources(workspaceId),
+        ...this.resourceCleanupRows(workspaceId),
       ].filter(
         (r) =>
           inScope(r) &&
           r.ownership !== "external" &&
-          !["planned", "stopped", "failed"].includes(r.state),
+          !["planned", "stopped", "failed", "destroyed"].includes(r.state),
       ),
     );
     const outcomes: any[] = [];
@@ -803,7 +989,7 @@ export class RuntimeManager {
     }
     for (const row of [
       ...this.listServices(workspaceId),
-      ...this.listResources(workspaceId),
+      ...this.resourceCleanupRows(workspaceId),
     ])
       if (row.state === "planned" && inScope(row)) {
         row.state = "stopped";
@@ -813,6 +999,7 @@ export class RuntimeManager {
         );
         this.releaseReservations(row.id);
       }
+    this.releaseUnusedRetainedReservations(workspaceId);
     if (failure)
       throw new DomainError(
         failure.code ?? "OWNERSHIP_UNVERIFIED",
@@ -898,7 +1085,10 @@ export class RuntimeManager {
           const hash = inputFingerprint(this.salt, {
             profile: n.profile,
             configuration: scope.revision.hash,
-            repository: await repositoryInputs(ctx.checkoutPath),
+            repository: await repositoryInputs(
+              ctx.checkoutPath,
+              n.profile.inputs ?? [],
+            ),
             resolved,
           });
           if (
@@ -952,7 +1142,7 @@ export class RuntimeManager {
   async destroy(workspaceId: string, checkoutId?: string, preview?: any) {
     await this.stop(workspaceId, checkoutId);
     const outcomes: any[] = [];
-    for (const row of this.listResources(workspaceId).filter(
+    for (const row of this.resourceCleanupRows(workspaceId).filter(
       (r) => !checkoutId || r.checkoutId === checkoutId,
     )) {
       if (row.ownership === "external") {
@@ -960,6 +1150,26 @@ export class RuntimeManager {
         continue;
       }
       try {
+        if (row.state === "destroyed") {
+          if (
+            !preview?.resources?.some(
+              (target: any) =>
+                target.id === row.id &&
+                target.identity === row.identity &&
+                target.namespace === row.namespace,
+            )
+          )
+            throw new DomainError(
+              "STALE_PREVIEW",
+              "Previously destroyed resource identity was not previewed",
+            );
+          outcomes.push({
+            id: row.id,
+            status: "destroyed",
+            alreadyDestroyed: true,
+          });
+          continue;
+        }
         if (row.ownership !== "owned")
           throw new DomainError(
             "OWNERSHIP_UNVERIFIED",

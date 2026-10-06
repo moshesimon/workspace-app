@@ -4,6 +4,14 @@
 This ExecPlan is a living document. Update Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective whenever implementation changes or stops. The user requested the format in [OpenAI's ExecPlan guide](https://developers.openai.com/cookbook/articles/codex_exec_plans); this file contains the necessary product and implementation context itself. This is a proposed implementation plan, not evidence of a built application.
 
 
+## Implementation update — 6 October 2026
+
+The user requested a usable demo rather than exhaustive completion of every release acceptance item. The application now builds in this supplied repository on `codex/worktree-manager`, in an attached isolated worktree. Core desktop, controller, manifest/discovery, Git worktrees/diffs/history, process/resources/setup, guarded lifecycle, MCP tools and reversible Codex integration are implemented. Source verification has 73 passing tests plus strict TypeScript. An unsigned macOS arm64 app was built; packaged desktop create/close/reopen was exercised successfully. Final demo packaging and live two-stack launch are recorded in the README and verification artifacts.
+
+The demo intentionally leaves broader release work open: actual user-project onboarding, live authenticated GitHub/Compose walkthroughs, other platforms/signing, longer preparation commands and stronger interrupted-setup recovery. Existing owned infrastructure definitions cannot be altered in-place; create a new workspace for those changes. Ordinary services and configuration revisions can be updated after Stop. Changes were committed at foundation, Git/transport, and complete-app milestones; final review fixes are committed separately.
+
+The original planning baseline and complete acceptance checklist below remain as the roadmap, not a claim that every item has been verified.
+
 ## Purpose / Big Picture
 
 
@@ -281,3 +289,13 @@ Verification fixtures must be clearly marked and isolated. Clean up only resourc
 Current artifacts are this plan and the revised brief. Future evidence should include discovery reports and portable manifests for different repository layouts, setup receipts/blockers, isolated resource identities, a packaged-runtime handshake, branch/source records, two-instance URL/marker output, local/PR diff screenshots, retained branches after removal, stale-preview refusal, and parity covering every CommandMap action. Leave clear which observations have actually occurred.
 
 For provenance, the current documentation confirms [local Codex stdio configuration](https://learn.chatgpt.com/docs/extend/mcp), [user skill discovery](https://learn.chatgpt.com/docs/build-skills), and [MCP annotations' limits](https://developers.openai.com/plugins/build/mcp-server). The plan's integration behavior above is explicit so execution does not depend on those pages. The [MCP server guide](https://modelcontextprotocol.io/docs/develop/build-server) supplies the current TypeScript server package and stdout rule. Electron's [process model](https://www.electronjs.org/docs/latest/tutorial/process-model), [renderer security guidance](https://www.electronjs.org/docs/latest/tutorial/security), and [native-module guidance](https://www.electronjs.org/docs/latest/tutorial/using-native-node-modules) support the packaging prototype; the actual prototype remains unperformed. Node 24 is listed as LTS in the [Node release table](https://nodejs.org/en/about/previous-releases). Git and GitHub command behavior was checked against [git-worktree](https://git-scm.com/docs/git-worktree), [gh pr list](https://cli.github.com/manual/gh_pr_list), [gh pr view](https://cli.github.com/manual/gh_pr_view), and [gh pr diff](https://cli.github.com/manual/gh_pr_diff).
+
+### Demo handoff evidence (6 October 2026)
+
+- `npm run check`: TypeScript passed; 73/73 tests passed.
+- `npm run package:mac`: unsigned arm64 app produced under `release/mac-arm64/Worktree Manager.app`; native SQLite rebuild completed.
+- `npm run verify:packaged`: two concurrent packaged stdio MCP clients shared one controller; all 53 registered tools were listed and stdout remained valid protocol.
+- `npm run verify:desktop`: actual packaged desktop created a workspace, closed and reopened with the same controller (earlier package, same renderer; final runtime fixes source-verified).
+- `npm run demo:launch`: final package started two full stacks. Checkout redesign: UI 3000/API 8080/data 9000. API sandbox: UI 3001/API 8081/data 9001. Both UI/API/data marker chains matched their own workspace IDs.
+- The app was launched with persistent demo state in `work/demo-state`. First demo frontend has two illustrative local changes for the Changes view. Reopen using `npm run demo:launch` from this implementation worktree.
+- Review findings addressed for idle liveness, singleton acquisition, client reconnection, preserved dependency ports, configuration drift, failed checkout retry, external resource revision application, historical resource cleanup, repeated cleanup, and resource terminal-state validation. Longer setup commands, interrupted finite setup ownership and historical preparation receipt selection remain outside this demo's exercised workflow.

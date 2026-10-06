@@ -1,10 +1,11 @@
-import { createHmac } from "node:crypto";
+import { createHmac, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, lstat, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
+import { DomainError } from "../../../contracts/src/errors.js";
 const exec = promisify(execFile);
-export async function repositoryInputs(root: string) {
+export async function repositoryInputs(root: string, declared: string[] = []) {
   let files: string[] = [];
   let source = "";
   try {
@@ -26,14 +27,36 @@ export async function repositoryInputs(root: string) {
       ),
     );
   }
+  const canonical = await realpath(root);
+  for (const file of declared) {
+    if (path.isAbsolute(file) || file.split(/[\\/]/).includes(".."))
+      throw new DomainError(
+        "INVALID_INPUT",
+        "Setup inputs must be relative and contained",
+      );
+    files.push(file);
+  }
   const inputs: Array<[string, string]> = [];
-  for (const file of files.sort()) {
+  for (const file of [...new Set(files)].sort()) {
     try {
+      const absolute = path.join(canonical, file);
+      const parent = await realpath(path.dirname(absolute));
+      if (path.relative(canonical, parent).startsWith(".."))
+        throw new DomainError(
+          "INVALID_INPUT",
+          "Setup input parent escapes checkout",
+        );
+      const stat = await lstat(absolute);
       inputs.push([
         file,
-        (await readFile(path.join(root, file))).toString("base64"),
+        stat.isSymbolicLink()
+          ? "symlink:" + (await readlink(absolute))
+          : createHash("sha256")
+              .update(await readFile(absolute))
+              .digest("hex"),
       ]);
-    } catch {
+    } catch (e: any) {
+      if (e instanceof DomainError) throw e;
       inputs.push([file, "missing"]);
     }
   }
