@@ -1,0 +1,78 @@
+{
+  "name": "worktree-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local workspaces, together.",
+  "author": "Worktree Manager",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/main.cjs",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build && electron .",
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit && npm test",
+    "test": "tsx --test tests/*.test.ts",
+    "package:mac": "npm run build && electron-builder --mac dir --publish never",
+    "demo:prepare": "tsx scripts/demo.ts",
+    "verify:runtime": "tsx --test tests/runtime.test.ts",
+    "verify:configuration": "tsx --test tests/configuration.test.ts",
+    "verify:git": "tsx --test tests/git.test.ts",
+    "verify:setup": "tsx --test tests/setup.test.ts",
+    "verify:resources": "tsx --test tests/resources.test.ts",
+    "verify:services": "tsx --test tests/services.test.ts",
+    "verify:lifecycle": "tsx --test tests/lifecycle.test.ts",
+    "verify:github": "tsx --test tests/github.test.ts",
+    "verify:desktop": "tsx scripts/verify-desktop.ts",
+    "verify:parity": "tsx --test tests/parity.test.ts",
+    "verify:integration": "tsx --test tests/integration.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "better-sqlite3": "13.0.3",
+    "zod": "^4.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "lucide-react": "^0.577.0",
+    "smol-toml": "^1.6.0"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.28.2",
+    "vite": "8.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "playwright": "^1.58.2"
+  },
+  "build": {
+    "appId": "local.worktree.manager",
+    "productName": "Worktree Manager",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "skills/**",
+      "package.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "target": [
+        "dir"
+      ]
+    }
+  }
+}
