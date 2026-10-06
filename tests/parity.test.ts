@@ -1,0 +1,7 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {InMemoryTransport} from '@modelcontextprotocol/sdk/inMemory.js';
+import {commands} from '../packages/contracts/src/commands.js';
+import {createMcpServer} from '../packages/mcp/src/server.js';
+test('MCP exposes every desktop command with typed inputs and accurate mutation metadata',async()=>{const calls:any[]=[];const server=createMcpServer({call:async(name,input)=>{calls.push({name,input});return {pid:123,protocolVersion:1}}});const client=new Client({name:'test',version:'1'});const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);try{const list=await client.listTools();assert.deepEqual(list.tools.map(t=>t.name).sort(),Object.keys(commands).map(n=>n.replaceAll('.','_')).sort());assert.equal(list.tools.find(t=>t.name==='destroy_execute')?.annotations?.destructiveHint,true);assert.equal(list.tools.find(t=>t.name==='lifecycle_refresh')?.annotations?.readOnlyHint,false);const result=await client.callTool({name:'controller_status',arguments:{}});assert.equal((result.structuredContent as any).result.protocolVersion,1);assert.equal(calls[0].name,'controller.status');const invalid=await client.callTool({name:'destroy_execute',arguments:{previewId:'x'}});assert.equal(invalid.isError,true);assert.equal(calls.length,1)}finally{await client.close();await server.close()}});
